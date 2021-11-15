@@ -1,0 +1,188 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+
+Mappings:
+  Constant:
+    ResourceId:
+      VpcId: vpc-xxxxxxxxxxxxxxxxx # your VPC ID
+      SubnetId: subnet-xxxxxxxxxxxxxxxxx # your subnet ID
+
+Resources:
+
+  ######################################################################
+  #  Lambda                                                            #
+  ######################################################################
+
+  # Lambda
+  PrivateApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: lambda_src/
+      Handler: app.lambda_handler
+      Runtime: python3.9
+      FunctionName: private-api
+      Role: !GetAtt PrivateApiRole.Arn
+      Events:
+        GetEndpoint:
+          Type: Api
+          Properties:
+            Path: /private-api-endpoint/{arg}
+            Method: get
+            RestApiId: !Ref PrivateApiApiGateway
+        PostEndpoint:
+          Type: Api
+          Properties:
+            Path: /private-api-endpoint
+            Method: post
+            RestApiId: !Ref PrivateApiApiGateway
+
+  # Lambda実行ロール
+  PrivateApiRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      RoleName: private-api-lambda-role
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+
+  ######################################################################
+  #  API Gateway                                                       #
+  ######################################################################
+
+  # Api GatewayへのLambdaアクセス許可
+  PrivateApiFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt PrivateApiFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${PrivateApiApiGateway}/*'
+
+  # API Gateway
+  PrivateApiApiGateway:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: private-api
+      StageName: api
+      MethodSettings:
+        # ログを有効化
+        - DataTraceEnabled: true
+          LoggingLevel: 'INFO'
+          ResourcePath: '/*'
+          HttpMethod: '*'
+      EndpointConfiguration:
+        Type: PRIVATE
+        VPCEndpointIds:
+          - !Ref PrivateApiVpcEndpoint
+      DefinitionBody:
+        openapi: 3.0.3
+        info:
+          title: private-api
+          description: private-api
+        schemes:
+          - https
+        consumes:
+          - application/json
+        produces:
+          - application/json
+        paths:
+          /private-api-endpoint/{arg}:
+            get:
+              # API GatewayがLambdaを呼び出す設定
+              x-amazon-apigateway-integration:
+                contentHandling: "CONVERT_TO_TEXT"
+                uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${PrivateApiFunction.Arn}/invocations"
+                passthroughBehavior: when_no_templates
+                payloadFormatVersion: "1.0"
+                connectionType: "INTERNET"
+                httpMethod: POST
+                type: aws_proxy
+          /private-api-endpoint:
+            post:
+              # API GatewayがLambdaを呼び出す設定
+              x-amazon-apigateway-integration:
+                contentHandling: "CONVERT_TO_TEXT"
+                uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${PrivateApiFunction.Arn}/invocations"
+                passthroughBehavior: when_no_templates
+                payloadFormatVersion: "1.0"
+                connectionType: "INTERNET"
+                httpMethod: POST
+                type: aws_proxy
+        # VPCエンドポイントからのリクエストのみに制限する。
+        x-amazon-apigateway-policy:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal: '*'
+              Action: 'execute-api:Invoke'
+              Resource:
+                - !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:*/*'
+              Condition:
+                StringEquals:
+                  aws:SourceVpce: !Ref PrivateApiVpcEndpoint
+
+
+  ######################################################################
+  #  API Gateway共通設定                                                #
+  ######################################################################
+
+  # API Gatewayのログ出力用ロール
+  ApiGatewayCloudWatchRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - apigateway.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs
+  # API Gatewayにログ出力用ロールを設定
+  ApiGatewayAccount:
+    Type: 'AWS::ApiGateway::Account'
+    Properties:
+      CloudWatchRoleArn: !GetAtt ApiGatewayCloudWatchRole.Arn
+
+
+  ######################################################################
+  #  VPCエンドポイント                                                   #
+  ######################################################################
+
+  # VPCエンドポイント
+  PrivateApiVpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.execute-api
+      SubnetIds:
+        - !FindInMap [Constant, ResourceId, SubnetId]
+      VpcId: !FindInMap [Constant, ResourceId, VpcId]
+      VpcEndpointType: Interface
+      SecurityGroupIds:
+        - !GetAtt PrivateApiSg.GroupId
+      PrivateDnsEnabled: true
+
+
+  # VPCエンドポイント用セキュリティグループ
+  PrivateApiSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: PrivateApiSg
+      GroupName: PrivateApiSg
+      VpcId: !FindInMap [Constant, ResourceId, VpcId]
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
